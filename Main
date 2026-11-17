@@ -1,0 +1,952 @@
+const { VK, Keyboard } = require('vk-io');
+const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
+const path = require('path');
+const Jimp = require('jimp');
+
+console.log("=========================================");
+console.log("ВЕРСИЯ NODE.JS:", process.version);
+console.log("=========================================");
+
+// ===== НАСТРОЙКИ =====
+const TOKEN = "vk1.a.AP1n2HYshIvxjIs4zgHk-8D9YhA5TfocGLGiegFtOPtiBsDsxtU2RY_4muinefxI4qPxKyUB-WaLyKE1BrqAYzPWmxWEBPCvmEoF4AESV9yVn1QOr_OglVaHUxk9ndwasEkxw7lZhl2POVPxMwY20-YsY1OKffhMa62Wn-lv-BoGsG9YmZE6CisTD2_AdJ4FniwDIIQsLajcxjzxW2U3S8YdITWeuQ2GKNmb1657HM0";
+const GROUP_ID = 243089386;
+const ADMIN_ID = 200005093141;
+const BONUS_CD = 86400; // 24 часа (в секундах)
+const FORTUNA_CD = 600;
+
+const DEFAULT_PROFILE_PHOTO = 'https://sun9-72.vkuserphoto.ru/s/v1/ig2/YNkLzyOfJjTTcjgSSuMgbqiNkNAf5lsXNkJ6PBZnpvPh3t6M2OX2KugvgTnTniTxhlNgbc2daekc1IqxA0LPwUMb.jpg?quality=95&as=32x22,48x34,72x50,108x76,160x112,240x168,277x194&from=bu&u=lu3E3ggWqF0yEAFf92En4aIiZtuv0TIPXL9GxEDIiJ4&cs=277x0';
+
+const ROULETTE_PHOTOS = [
+    'https://vk.ru/photo-221392393_458171207',
+];
+
+const vk = new VK({ 
+    token: TOKEN, 
+    apiVersion: '5.199',
+    pollingGroupId: GROUP_ID 
+});
+
+const DATA_DIR = './data';
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+const DB_FILE = path.join(DATA_DIR, 'game.db');
+
+// ===== БАЗА ДАННЫХ =====
+const db = new sqlite3.Database(DB_FILE);
+const dbRun = (query, params = []) => new Promise((res, rej) => db.run(query, params, function(e) { e ? rej(e) : res(this); }));
+const dbGet = (query, params = []) => new Promise((res, rej) => db.get(query, params, (e, r) => e ? rej(e) : res(r)));
+const dbAll = (query, params = []) => new Promise((res, rej) => db.all(query, params, (e, r) => e ? rej(e) : res(r)));
+
+const gameCooldowns = new Map(); 
+const adminStates = new Map(); 
+const spamCache = new Map(); 
+const chsbNotifyCache = new Map(); 
+
+// [НОВОЕ] Хранилище для активных математических примеров
+const activeMathGames = new Map(); 
+
+const BIZ_DATA = {
+    'шаурма': { name: '🌯 Шаурма', price: 500000, baseIncome: 2000 },
+    'кафе': { name: '☕ Кафе', price: 1500000, baseIncome: 4000 },
+    'game zone': { name: '🕹️ Отдел Game Zone', price: 5000000, baseIncome: 6000 },
+    'казино': { name: '🎰 Казино', price: 15000000, baseIncome: 10000 },
+    'пятерочка': { name: '🏪 24/7 Пятёрочка', price: 50000000, baseIncome: 15000 }
+};
+
+const CARS_DATA = {
+    'м5 ф90': { name: 'BMW M5 F90', price: 15000000, sellPrice: 10000000 },
+    'м5 ф10': { name: 'BMW M5 F10', price: 8000000, sellPrice: 5000000 },
+    'м3': { name: 'BMW M3 G80', price: 12000000, sellPrice: 8000000 },
+    'мерседес': { name: 'Mercedes-Benz E-Class', price: 10000000, sellPrice: 6000000 },
+    'ауди': { name: 'Audi RS7', price: 18000000, sellPrice: 12000000 },
+    'ламборгини': { name: 'Lamborghini Huracan', price: 35000000, sellPrice: 25000000 },
+    'порше': { name: 'Porsche 911 Turbo', price: 28000000, sellPrice: 20000000 }
+};
+
+const PROPERTY_DATA = {
+    'нижегородская': { name: 'Нижегородская', housePrice: 5000000, garagePrice: 1000000 },
+    'рублевка': { name: 'Рублевка', housePrice: 25000000, garagePrice: 5000000 },
+    'егоровка': { name: 'Егоровка', housePrice: 50000000, garagePrice: 10000000 },
+    'гарель': { name: 'Гарель', housePrice: 100000000, garagePrice: 20000000 }
+};
+
+async function initDB() {
+    await dbRun("CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, balance INTEGER DEFAULT 1000, reputation INTEGER DEFAULT 0, xp INTEGER DEFAULT 0, level INTEGER DEFAULT 1, reg_date TEXT, duel_wins INTEGER DEFAULT 0, bonus_count INTEGER DEFAULT 0)");
+    await dbRun("CREATE TABLE IF NOT EXISTS active_duels (msg_id TEXT PRIMARY KEY, challenger TEXT, bet INTEGER, peer_id TEXT)");
+    await dbRun("CREATE TABLE IF NOT EXISTS bonus_cd (user_id TEXT PRIMARY KEY, last_used INTEGER)");
+    await dbRun("CREATE TABLE IF NOT EXISTS fortune_cd (user_id TEXT PRIMARY KEY, last_used INTEGER)");
+    await dbRun("CREATE TABLE IF NOT EXISTS promos (code TEXT PRIMARY KEY, amount INTEGER, limit_count INTEGER, used_by TEXT DEFAULT '')");
+    await dbRun("CREATE TABLE IF NOT EXISTS games (game_id TEXT PRIMARY KEY, user_id TEXT, bet INTEGER, mines TEXT, opened TEXT, multiplier REAL, msg_id TEXT, start_time INTEGER)");
+    await dbRun("CREATE TABLE IF NOT EXISTS blacklist (user_id TEXT PRIMARY KEY, reason TEXT, until INTEGER DEFAULT 0)");
+    await dbRun("CREATE TABLE IF NOT EXISTS chat_bans (user_id TEXT, peer_id TEXT, reason TEXT, PRIMARY KEY (user_id, peer_id))");
+    await dbRun("CREATE TABLE IF NOT EXISTS mutes (user_id TEXT, peer_id TEXT, mute_until INTEGER, reason TEXT, PRIMARY KEY (user_id, peer_id))");
+    await dbRun("CREATE TABLE IF NOT EXISTS frozen (user_id TEXT PRIMARY KEY)");
+    await dbRun("CREATE TABLE IF NOT EXISTS prop_deals (id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id TEXT, buyer_id TEXT, type TEXT, prop_id INTEGER, price INTEGER, peer_id TEXT)");
+    await dbRun("CREATE TABLE IF NOT EXISTS chat_messages (peer_id TEXT, user_id TEXT, count INTEGER DEFAULT 0, PRIMARY KEY (peer_id, user_id))");
+    await dbRun("CREATE TABLE IF NOT EXISTS businesses (user_id TEXT PRIMARY KEY, biz_name TEXT, level INTEGER DEFAULT 1, balance INTEGER DEFAULT 0, last_income INTEGER, last_withdraw INTEGER DEFAULT 0)");
+    await dbRun("CREATE TABLE IF NOT EXISTS rep_limits (user_id TEXT PRIMARY KEY, count INTEGER DEFAULT 0, last_reset INTEGER)");
+    await dbRun("CREATE TABLE IF NOT EXISTS work_cd (user_id TEXT PRIMARY KEY, count INTEGER DEFAULT 0, last_reset INTEGER)");
+    await dbRun("CREATE TABLE IF NOT EXISTS properties (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, location TEXT, tier INTEGER, owner_id TEXT)");
+    await dbRun("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)");
+    
+    // [НОВОЕ] Таблица для сим-карт
+    await dbRun("CREATE TABLE IF NOT EXISTS phones (number TEXT PRIMARY KEY, user_id TEXT UNIQUE)");
+
+    try { await dbRun("ALTER TABLE users ADD COLUMN reputation INTEGER DEFAULT 0"); } catch(e) {}
+    try { await dbRun("ALTER TABLE users ADD COLUMN xp INTEGER DEFAULT 0"); } catch(e) {}
+    try { await dbRun("ALTER TABLE users ADD COLUMN level INTEGER DEFAULT 1"); } catch(e) {}
+    try { await dbRun("ALTER TABLE users ADD COLUMN reg_date TEXT"); } catch(e) {}
+    try { await dbRun("ALTER TABLE users ADD COLUMN duel_wins INTEGER DEFAULT 0"); } catch(e) {}
+    try { await dbRun("ALTER TABLE users ADD COLUMN bonus_count INTEGER DEFAULT 0"); } catch(e) {}
+    try { await dbRun("ALTER TABLE users ADD COLUMN car TEXT DEFAULT NULL"); } catch(e) {}
+    try { await dbRun("ALTER TABLE users ADD COLUMN last_bonus_date TEXT"); } catch(e) {}
+    try { await dbRun("ALTER TABLE users ADD COLUMN bonus_streak INTEGER DEFAULT 0"); } catch(e) {}
+    try { await dbRun("ALTER TABLE businesses ADD COLUMN last_withdraw INTEGER DEFAULT 0"); } catch(e) {}
+    try { await dbRun("ALTER TABLE games ADD COLUMN start_time INTEGER"); } catch(e) {}
+    try { await dbRun("ALTER TABLE blacklist ADD COLUMN until INTEGER DEFAULT 0"); } catch(e) {}
+    
+    // [НОВОЕ] Колонка для телефона в профиле
+    try { await dbRun("ALTER TABLE users ADD COLUMN phone TEXT DEFAULT 'Нет'"); } catch(e) {}
+    
+    await dbRun("INSERT OR IGNORE INTO settings (key, value) VALUES ('antispam_enabled', '0')");
+    await dbRun("INSERT OR IGNORE INTO settings (key, value) VALUES ('antispam_limit', '5')");
+    await dbRun("INSERT OR IGNORE INTO settings (key, value) VALUES ('antispam_time', '60')");
+    await dbRun("INSERT OR IGNORE INTO settings (key, value) VALUES ('antispam_mute', '10')");
+    
+    console.log("--- БАЗА ДАННЫХ ГОТОВА ---");
+}
+initDB();
+
+// ===== ХЕЛПЕРЫ =====
+function parseAmount(str) {
+    if (!str) return 0;
+    str = String(str).toLowerCase().replace(/\s/g, '');
+    
+    if (str.endsWith('всё') || str.endsWith('все') || str.endsWith('вб')) return 'ALL'; 
+    
+    let mult = 1;
+    if (str.endsWith('кккк') || str.endsWith('kkkk')) { mult = 1000000000000; str = str.slice(0, -4); }
+    else if (str.endsWith('ккк') || str.endsWith('kkk')) { mult = 1000000000; str = str.slice(0, -3); }
+    else if (str.endsWith('кк') || str.endsWith('kk')) { mult = 1000000; str = str.slice(0, -2); }
+    else if (str.endsWith('к') || str.endsWith('k')) { mult = 1000; str = str.slice(0, -1); }
+    else if (str.endsWith('м') || str.endsWith('m')) { mult = 1000000; str = str.slice(0, -1); }
+    
+    let num = parseFloat(str.replace(',', '.'));
+    if (isNaN(num)) return 0;
+    return Math.floor(num * mult);
+}
+
+function formatShortMoney(num) {
+    if (num >= 1000000000000) return (num / 1000000000000).toFixed(2).replace(/\.00$/, '') + 'кккк';
+    if (num >= 1000000000) return (num / 1000000000).toFixed(2).replace(/\.00$/, '') + 'ккк';
+    if (num >= 1000000) return (num / 1000000).toFixed(2).replace(/\.00$/, '') + 'кк';
+    if (num >= 1000) return (num / 1000).toFixed(2).replace(/\.00$/, '') + 'к';
+    return num.toString();
+}
+
+async function getBalance(userId) {
+    const row = await dbGet("SELECT balance FROM users WHERE user_id = ?", [String(userId)]);
+    if (!row) {
+        await dbRun("INSERT INTO users (user_id, balance) VALUES (?, 1000)", [String(userId)]);
+        return 1000;
+    }
+    let bal = Number(row.balance);
+    if (isNaN(bal) || !isFinite(bal)) {
+        await dbRun("UPDATE users SET balance = 0 WHERE user_id = ?", [String(userId)]);
+        return 0;
+    }
+    return bal;
+}
+
+async function updateBalance(userId, amount) {
+    const bal = await getBalance(userId);
+    let amt = Number(amount);
+    if (isNaN(amt) || !isFinite(amt)) amt = 0;
+    const newBal = Math.floor(Number(bal) + amt);
+    await dbRun("UPDATE users SET balance = ? WHERE user_id = ?", [newBal, String(userId)]);
+}
+
+async function getReputation(userId) {
+    const row = await dbGet("SELECT reputation FROM users WHERE user_id = ?", [String(userId)]);
+    return row ? (Number(row.reputation) || 0) : 0;
+}
+
+async function updateReputation(userId, amount) {
+    const rep = await getReputation(userId);
+    await dbRun("UPDATE users SET reputation = ? WHERE user_id = ?", [rep + amount, String(userId)]);
+}
+
+async function getFullName(userId) {
+    try {
+        const [user] = await vk.api.users.get({ user_ids: userId });
+        return `[id${userId}|${user.first_name} ${user.last_name || ''}]`;
+    } catch { return `[id${userId}|Игрок]`; }
+}
+
+function formatMoney(num) { 
+    let n = Number(num);
+    if (isNaN(n) || !isFinite(n)) n = 0;
+    return n.toLocaleString('ru-RU'); 
+}
+
+async function getTargetAndReason(message, cmdName) {
+    let targetId = null;
+    let text = message.text || '';
+    let reason = text.replace(new RegExp(`^\\/?${cmdName}\\s*`, 'i'), '');
+
+    if (message.hasReplyMessage) {
+        targetId = message.replyMessage.senderId;
+    } else {
+        const idMatch = reason.match(/\[id(\d+)\|[^\]]+\]/i);
+        if (idMatch) {
+            targetId = parseInt(idMatch[1]);
+            reason = reason.replace(idMatch[0], ''); 
+        } else {
+            const atIdMatch = reason.match(/@id(\d+)/i);
+            if (atIdMatch) {
+                targetId = parseInt(atIdMatch[1]);
+                reason = reason.replace(atIdMatch[0], ''); 
+            } else {
+                const urlMatch = reason.match(/(?:https?:\/\/)?(?:vk\.com|vk\.ru)\/([a-zA-Z0-9._]+)/i);
+                if (urlMatch) {
+                    try {
+                        const res = await vk.api.utils.resolveScreenName({ screen_name: urlMatch[1] });
+                        if (res.type === 'user' || res.type === 'group') targetId = res.object_id;
+                    } catch (e) {}
+                    reason = reason.replace(urlMatch[0], ''); 
+                } else {
+                    const mentionMatch = reason.match(/@([a-zA-Z0-9._]+)/i);
+                    if (mentionMatch) {
+                        try {
+                            const res = await vk.api.utils.resolveScreenName({ screen_name: mentionMatch[1] });
+                            if (res.type === 'user') targetId = res.object_id;
+                        } catch (e) {}
+                        reason = reason.replace(mentionMatch[0], ''); 
+                    }
+                }
+            }
+        }
+    }
+
+    reason = reason.replace(/[\[\]]/g, '').replace(/"/g, '').trim();
+    if (!reason) reason = "Причина не указана";
+
+    return { targetId, reason };
+}
+
+// ===== ГЕНЕРАЦИЯ ПРОФИЛЯ (АВАТАРКА + НИК) =====
+async function generateProfileImage(userId) {
+    try {
+        const [user] = await vk.api.users.get({ user_ids: userId, fields: 'photo_200' });
+        const nameText = `${user.first_name} ${user.last_name || ''}`.trim();
+        const avatarUrl = user.photo_200 || DEFAULT_PROFILE_PHOTO;
+
+        const avatar = await Jimp.read(avatarUrl);
+        avatar.cover(400, 400);
+
+        const canvas = new Jimp(400, 450, 0x101010FF);
+        canvas.composite(avatar, 0, 0);
+
+        const banner = new Jimp(400, 50, 0x000000B0);
+        canvas.composite(banner, 0, 400);
+
+        // ИСПРАВЛЕНО: добавлен await перед загрузкой шрифта
+        const font = await Jimp.loadFont("https://cdn.jsdelivr.net/gh/Fluffffy/jimp-cyrillic-fonts@master/fonts/open-sans-32-white/open-sans-32-white.fnt");
+        
+        canvas.print(
+            font,
+            0,
+            400,
+            {
+                text: nameText,
+                alignmentX: Jimp.HORIZONTAL_ALIGN_CENTER,
+                alignmentY: Jimp.VERTICAL_ALIGN_MIDDLE
+            },
+            400,
+            50
+        );
+
+        return await canvas.getBufferAsync(Jimp.MIME_PNG);
+    } catch (e) {
+        console.error("Ошибка генерации фото профиля:", e);
+        return null;
+    }
+}
+
+// ===== ГЕНЕРАТОР ДЛЯ МИН =====
+function getMinesGameUI(gameId, bet, minesCount, minesArr, opened, isLoss = false, hitCell = null, name = "", balance = 0, timeLeft = 60) {
+    const totalSafe = 9 - minesCount;
+    const currentOpened = opened.length;
+
+    let currentMult = 1.0;
+    for (let i = 0; i < currentOpened; i++) {
+        currentMult *= (9 - i) / (9 - minesCount - i);
+    }
+    currentMult = Math.round(currentMult * 0.95 * 100) / 100;
+    const currentMoney = Math.floor(bet * currentMult);
+
+    let nextMult = 1.0;
+    if (currentOpened < totalSafe) {
+        for (let i = 0; i <= currentOpened; i++) {
+            nextMult *= (9 - i) / (9 - minesCount - i);
+        }
+        nextMult = Math.round(nextMult * 0.95 * 100) / 100;
+    }
+    
+    const nextMoney = Math.floor(bet * nextMult);
+    const chance = Math.floor(((9 - minesCount - currentOpened) / (9 - currentOpened)) * 100);
+    let progressBar = "🟩".repeat(currentOpened) + "⬜".repeat(totalSafe - currentOpened);
+
+    if (isLoss) {
+        const lostMoney = currentMoney;
+        return {
+            text: `💥 БАБАХ! ПОРАЖЕНИЕ\n────────────────────\n👤 ${name} наступил(а) на мину!\n💣 Мин на поле: ${minesCount}\n✅ Успел(а) открыть: ${currentOpened}\n\n📉 Потеряно: -${bet} 💰\n😢 Не забрал(а): ${lostMoney} 💰 (x${currentMult})\n💳 Баланс: ${formatMoney(balance)} 💰\n\n💬 Бывает. Следующая будет твоей 🍀`,
+            kb: buildMinesKb(gameId, opened, minesArr, true, hitCell)
+        };
+    } else {
+        const randomPhrases = [
+            "Выбирай клетку! Первый ход — самый волнующий 😈",
+            "Чисто! Сапёр бы гордился 👏",
+            "Ещё немного, и можно забирать 💸",
+            "Осторожно, мины рядом... 💣",
+            "Фортуна улыбается тебе 😉"
+        ];
+        const phrase = currentOpened === 0 ? randomPhrases[0] : randomPhrases[Math.floor(Math.random() * (randomPhrases.length - 1)) + 1];
+
+        return {
+            text: `💣 МИНЫ\n────────────────────\n👤 ${name}\n💵 Ставка: ${bet} | 💣 Мин: ${minesCount}\n\n${progressBar} ${currentOpened}/${totalSafe}\n📈 Сейчас: x${currentMult.toFixed(2)} → ${currentMoney} 💰\n🎯 Следующая: x${nextMult.toFixed(2)} → ${nextMoney} 💰\n🍀 Шанс безопасной клетки: ${chance}%\n⏱ Осталось: ${timeLeft} сек.\n\n💬 ${phrase}`,
+            kb: buildMinesKb(gameId, opened, minesArr, false, null, currentMoney)
+        };
+    }
+}
+
+function buildMinesKb(gameId, opened, mines = [], isGameOver = false, hitCell = null, currentMoney = 0) {
+    const kb = Keyboard.builder().inline();
+    for (let i = 1; i <= 9; i++) {
+        if (isGameOver) {
+            if (i === hitCell) {
+                kb.callbackButton({ label: '💥', payload: { cmd: 'none' }, color: Keyboard.NEGATIVE_COLOR });
+            } else if (mines.includes(i)) {
+                kb.callbackButton({ label: '💣', payload: { cmd: 'none' }, color: Keyboard.NEGATIVE_COLOR });
+            } else if (opened.includes(i)) {
+                kb.callbackButton({ label: '✅', payload: { cmd: 'none' }, color: Keyboard.POSITIVE_COLOR });
+            } else {
+                kb.callbackButton({ label: '⬜', payload: { cmd: 'none' }, color: Keyboard.SECONDARY_COLOR });
+            }
+        } else {
+            if (opened.includes(i)) {
+                kb.callbackButton({ label: '✅', payload: { cmd: 'none' }, color: Keyboard.POSITIVE_COLOR });
+            } else {
+                kb.callbackButton({ label: '❓', payload: { cmd: 'mines_click', gameId: String(gameId), cell: String(i) }, color: Keyboard.SECONDARY_COLOR });
+            }
+        }
+        if (i % 3 === 0) {
+            kb.row();
+        }
+    }
+    
+    if (!isGameOver && currentMoney > 0 && opened.length > 0) {
+        kb.callbackButton({ label: `💰 Забрать ${currentMoney}`, payload: { cmd: 'mines_cashout', gameId: String(gameId) }, color: Keyboard.SECONDARY_COLOR });
+    }
+    return kb.toString();
+}
+
+// ===== КЛАВИАТУРЫ =====
+const mainKb = Keyboard.builder()
+    .textButton({ label: '💼 Работа', payload: 'work', color: Keyboard.POSITIVE_COLOR })
+    .textButton({ label: '🎰 Рулетка', payload: 'roulette', color: Keyboard.PRIMARY_COLOR })
+    .row()
+    .textButton({ label: '👤 Профиль', payload: 'profile', color: Keyboard.SECONDARY_COLOR })
+    .textButton({ label: '🏆 Топ', payload: 'top', color: Keyboard.SECONDARY_COLOR });
+
+const getWorkKb = () => {
+    return Keyboard.builder().inline()
+        .callbackButton({ label: '🎣 Рыбалка', payload: { cmd: 'work_do', type: 'Рыбалка' }, color: Keyboard.POSITIVE_COLOR })
+        .callbackButton({ label: '🚕 Такси', payload: { cmd: 'work_do', type: 'Такси' }, color: Keyboard.POSITIVE_COLOR })
+        .callbackButton({ label: '🔫 Охота', payload: { cmd: 'work_do', type: 'Охота' }, color: Keyboard.POSITIVE_COLOR })
+        .toString();
+};
+
+const getCasinoKb = () => {
+    return Keyboard.builder().inline()
+        .callbackButton({ label: 'Рулетка', payload: { cmd: 'casino_info', game: 'roulette' }, color: Keyboard.SECONDARY_COLOR })
+        .callbackButton({ label: 'Краш', payload: { cmd: 'casino_info', game: 'crash' }, color: Keyboard.SECONDARY_COLOR })
+        .row()
+        .callbackButton({ label: 'Монетка', payload: { cmd: 'casino_info', game: 'coin' }, color: Keyboard.SECONDARY_COLOR })
+        .callbackButton({ label: 'Стакан', payload: { cmd: 'casino_info', game: 'glass' }, color: Keyboard.SECONDARY_COLOR })
+        .row()
+        .callbackButton({ label: 'Кубик', payload: { cmd: 'casino_info', game: 'dice' }, color: Keyboard.SECONDARY_COLOR })
+        .callbackButton({ label: 'Автомат', payload: { cmd: 'casino_info', game: 'slot' }, color: Keyboard.SECONDARY_COLOR })
+        .row()
+        .callbackButton({ label: 'Блэкджек', payload: { cmd: 'casino_info', game: 'blackjack' }, color: Keyboard.NEGATIVE_COLOR })
+        .callbackButton({ label: 'Дрим', payload: { cmd: 'casino_info', game: 'dream' }, color: Keyboard.NEGATIVE_COLOR })
+        .toString();
+};
+
+const getHelpKb = () => {
+    return Keyboard.builder().inline()
+        .callbackButton({ label: '🎰 Игры', payload: { cmd: 'help_menu', section: 'games' }, color: Keyboard.PRIMARY_COLOR })
+        .callbackButton({ label: '💼 Экономика', payload: { cmd: 'help_menu', section: 'eco' }, color: Keyboard.SECONDARY_COLOR })
+        .row()
+        .callbackButton({ label: '🏠 Дома', payload: { cmd: 'help_menu', section: 'houses' }, color: Keyboard.SECONDARY_COLOR })
+        .callbackButton({ label: '🏘️ Гаражи', payload: { cmd: 'help_menu', section: 'garages' }, color: Keyboard.SECONDARY_COLOR })
+        .row()
+        .callbackButton({ label: '👤 Профиль', payload: { cmd: 'help_menu', section: 'profile' }, color: Keyboard.SECONDARY_COLOR })
+        .toString();
+};
+
+const getHelpBackKb = () => {
+    return Keyboard.builder().inline()
+        .callbackButton({ label: '🔙 Назад', payload: { cmd: 'help_start' }, color: Keyboard.SECONDARY_COLOR })
+        .toString();
+};
+
+const getSettingsKb = async (enabled, limit, time, mute) => {
+    const kb = Keyboard.builder().inline();
+    kb.callbackButton({ label: '🟢 Включить', payload: { cmd: 'settings_toggle', state: '1' }, color: enabled === '1' ? Keyboard.POSITIVE_COLOR : Keyboard.SECONDARY_COLOR });
+    kb.callbackButton({ label: '🔴 Выключить', payload: { cmd: 'settings_toggle', state: '0' }, color: enabled === '0' ? Keyboard.NEGATIVE_COLOR : Keyboard.SECONDARY_COLOR });
+    kb.row();
+    kb.callbackButton({ label: `Лимит: ${limit}`, payload: { cmd: 'settings_edit', field: 'limit' }, color: Keyboard.SECONDARY_COLOR });
+    kb.callbackButton({ label: `Время (сек): ${time}`, payload: { cmd: 'settings_edit', field: 'time' }, color: Keyboard.SECONDARY_COLOR });
+    kb.row();
+    kb.callbackButton({ label: `Мут (мин): ${mute}`, payload: { cmd: 'settings_edit', field: 'mute' }, color: Keyboard.SECONDARY_COLOR });
+    return kb.toString();
+};
+
+const getDuelKb = (duelId) => {
+    return Keyboard.builder().inline().callbackButton({
+        label: '⚔️ Сразиться',
+        payload: { cmd: 'duel_accept', duel_id: duelId },
+        color: Keyboard.POSITIVE_COLOR
+    }).toString();
+};
+
+const getMinesCountKb = (gameId) => {
+    const kb = Keyboard.builder().inline();
+    let count = 0;
+    for (let i = 2; i <= 8; i++) {
+        kb.callbackButton({ label: `${i} 💣`, payload: { cmd: 'mines_set', gameId: String(gameId), count: String(i) }, color: Keyboard.SECONDARY_COLOR });
+        count++;
+        if (count % 4 === 0 && i !== 8) {
+            kb.row();
+        }
+    }
+    return kb.toString();
+};
+
+const getTopKb = (authorId, type = 'coins', scope = 'chat', repType = 'pos') => {
+    const kb = Keyboard.builder().inline();
+    
+    kb.callbackButton({ label: '💰 Моне...', payload: { cmd: 'top_menu', type: 'coins', scope, repType, author: authorId }, color: type === 'coins' ? Keyboard.PRIMARY_COLOR : Keyboard.SECONDARY_COLOR });
+    kb.callbackButton({ label: '📊 Уров...', payload: { cmd: 'top_menu', type: 'level', scope, repType, author: authorId }, color: type === 'level' ? Keyboard.PRIMARY_COLOR : Keyboard.SECONDARY_COLOR });
+    kb.callbackButton({ label: '⭐ Репу...', payload: { cmd: 'top_menu', type: 'rep', scope, repType, author: authorId }, color: type === 'rep' ? Keyboard.PRIMARY_COLOR : Keyboard.SECONDARY_COLOR });
+    kb.row();
+
+    kb.callbackButton({ label: '⚔️ Дуэли', payload: { cmd: 'top_menu', type: 'duels', scope, repType, author: authorId }, color: type === 'duels' ? Keyboard.PRIMARY_COLOR : Keyboard.SECONDARY_COLOR });
+    kb.callbackButton({ label: '🎁 Бонус', payload: { cmd: 'top_menu', type: 'bonus', scope, repType, author: authorId }, color: type === 'bonus' ? Keyboard.PRIMARY_COLOR : Keyboard.SECONDARY_COLOR });
+    kb.row();
+    
+    if (type === 'rep') {
+        kb.callbackButton({ label: '➕ Положит.', payload: { cmd: 'top_menu', type: 'rep', scope, repType: 'pos', author: authorId }, color: repType === 'pos' ? Keyboard.POSITIVE_COLOR : Keyboard.SECONDARY_COLOR });
+        kb.callbackButton({ label: '➖ Отрицат.', payload: { cmd: 'top_menu', type: 'rep', scope, repType: 'neg', author: authorId }, color: repType === 'neg' ? Keyboard.NEGATIVE_COLOR : Keyboard.SECONDARY_COLOR });
+        kb.row();
+    }
+
+    kb.callbackButton({ label: '🌍 Общее', payload: { cmd: 'top_menu', type, scope: 'global', repType, author: authorId }, color: scope === 'global' ? Keyboard.PRIMARY_COLOR : Keyboard.SECONDARY_COLOR });
+    kb.callbackButton({ label: '💬 В беседе', payload: { cmd: 'top_menu', type, scope: 'chat', repType, author: authorId }, color: scope === 'chat' ? Keyboard.PRIMARY_COLOR : Keyboard.SECONDARY_COLOR });
+    kb.row();
+    
+    kb.callbackButton({ label: '🔙 Назад', payload: { cmd: 'top_back', author: authorId }, color: Keyboard.SECONDARY_COLOR });
+
+    return kb.toString();
+};
+
+const getBizKb = (authorId) => {
+    return Keyboard.builder().inline()
+        .callbackButton({ label: 'Повысить уровень', payload: { cmd: 'biz_upgrade', author: authorId }, color: Keyboard.SECONDARY_COLOR })
+        .toString();
+};
+
+// ===== ФУНКЦИИ ФОТО =====
+async function getRouletteAttachment() {
+    if (ROULETTE_PHOTOS.length === 0) {
+        return null;
+    }
+    const url = ROULETTE_PHOTOS[Math.floor(Math.random() * ROULETTE_PHOTOS.length)];
+    try {
+        const uploaded = await vk.upload.messagePhoto({ source: { value: url } });
+        return uploaded.toString();
+    } catch (e) {
+        console.error("Ошибка загрузки фото для рулетки:", e);
+        return null;
+    }
+}
+
+// ===== ПРИВЕТСТВИЕ =====
+vk.updates.on('chat_invite_user', async (context) => {
+    if (context.memberId > 0) {
+        const globalBan = await dbGet("SELECT reason, until FROM blacklist WHERE user_id = ?", [String(context.memberId)]);
+        if (globalBan) {
+            if (globalBan.until !== 0 && Date.now() > globalBan.until) {
+                await dbRun("DELETE FROM blacklist WHERE user_id = ?", [String(context.memberId)]);
+            } else {
+                try {
+                    await vk.api.messages.removeChatUser({ chat_id: context.peerId - 2000000000, user_id: context.memberId, group_id: GROUP_ID });
+                } catch(e) {}
+                return;
+            }
+        }
+
+        const chatBan = await dbGet("SELECT reason FROM chat_bans WHERE user_id = ? AND peer_id = ?", [String(context.memberId), String(context.peerId)]);
+        if (chatBan) {
+            try {
+                await vk.api.messages.removeChatUser({ chat_id: context.peerId - 2000000000, user_id: context.memberId, group_id: GROUP_ID });
+                await vk.api.messages.send({
+                    peer_id: context.peerId,
+                    message: `🚫 [id${context.memberId}|Игрок] был автоматически исключен из беседы, так как имеет бан в этой беседе.\n📌 Причина: ${chatBan.reason}`,
+                    random_id: Math.floor(Math.random() * 1000000000),
+                    disable_mentions: 1
+                });
+            } catch(e) {} 
+        }
+    }
+
+    if (String(context.memberId) === String(-GROUP_ID)) {
+        const actKb = Keyboard.builder().inline()
+            .callbackButton({ label: 'Активировать', payload: { cmd: 'activate_bot' }, color: Keyboard.POSITIVE_COLOR })
+            .callbackButton({ label: 'Не активировать', payload: { cmd: 'decline_bot' }, color: Keyboard.NEGATIVE_COLOR });
+        
+        try {
+            await vk.api.messages.send({
+                peer_id: context.peerId,
+                message: "Привет! Я Официальный бот Game Zone. Для того чтобы я начал работать, выдайте мне права администратора и напишите /start. После этого напишите /help для ознакомления с командами.",
+                keyboard: actKb.toString(),
+                random_id: Math.floor(Math.random() * 1000000000),
+                group_id: GROUP_ID,
+                disable_mentions: 1
+            });
+        } catch (err) {}
+    }
+}); 
+
+// ===== [НОВОЕ] ТАЙМЕР ДЛЯ МАТЕМАТИЧЕСКОГО ПРИМЕРА (КАЖДЫЕ 10 МИНУТ) =====
+setInterval(async () => {
+    try {
+        // Берем все беседы, где когда-либо были сообщения
+        const chats = await dbAll("SELECT DISTINCT peer_id FROM chat_messages");
+        
+        for (const row of chats) {
+            const peerId = row.peer_id;
+            // Проверяем, что это беседа (начинается с 2000000000), а не ЛС
+            if (Number(peerId) < 2000000000) continue;
+
+            // Генерируем пример
+            const a = Math.floor(Math.random() * 100);
+            const b = Math.floor(Math.random() * 100);
+            const isPlus = Math.random() > 0.5;
+            const answer = isPlus ? a + b : a - b;
+            const exampleText = `${a} ${isPlus ? '+' : '-'} ${b} = ?`;
+
+            // Определяем сложность и награду
+            let reward = 10000; // Легкий
+            let difficultyText = '📗 Легкий';
+            if (a > 50 || b > 50) {
+                reward = 50000; // Средний
+                difficultyText = '📙 Средний';
+            }
+            if (a > 80 && b > 80) {
+                reward = 100000; // Сложный
+                difficultyText = '📕 Сложный';
+            }
+
+            // Записываем в память
+            activeMathGames.set(String(peerId), { answer, reward });
+
+            // Отправляем
+            try {
+                await vk.api.messages.send({
+                    peer_id: peerId,
+                    message: `${difficultyText} математический пример!\n⏳ Пример: ${exampleText}\n🎁 Награда: ${formatMoney(reward)} монет.\n\n➡️ Для получения награды просто напишите ответ в беседе. Первый, кто правильно ответит, получает приз! @all`,
+                    random_id: Math.floor(Math.random() * 1000000000),
+                    disable_mentions: 0
+                });
+            } catch(e) {
+                // Если бот не может писать в беседу, просто игнорируем
+            }
+        }
+    } catch (e) {
+        console.error('Ошибка в таймере математики:', e);
+    }
+}, 10 * 60 * 1000); // 10 минут
+
+// ===== ОБРАБОТКА СООБЩЕНИЙ =====
+vk.updates.on('message_new', async (message) => {
+    if (message.isOutbox) {
+        return;
+    }
+    if (message.senderId < 0) {
+        return;
+    }
+
+    try {
+        const text = message.text ? message.text.trim().toLowerCase() : '';
+        if (!text) {
+            return;
+        }
+
+        const userId = message.senderId;
+        const peerId = message.peerId;
+        const isLs = peerId === userId;
+
+        const cleanText = text.replace(/\//g, '').trim();
+        const parts = cleanText.split(/\s+/);
+        const cmdWord = parts[0];
+
+        // --- ЗАМОРОЗКА ---
+        if (userId !== ADMIN_ID) {
+            const isFrozen = await dbGet("SELECT user_id FROM frozen WHERE user_id = ?", [String(userId)]);
+            if (isFrozen) {
+                return await message.reply("💀 Вы заморожены в боте. Ожидайте, когда вам выдадут наказание!");
+            }
+        }
+
+        // --- ГЛОБАЛЬНЫЙ ЧС ---
+        if (userId !== ADMIN_ID) {
+            const isBlacklisted = await dbGet("SELECT reason, until FROM blacklist WHERE user_id = ?", [String(userId)]);
+            if (isBlacklisted) {
+                if (isBlacklisted.until !== 0 && Date.now() > isBlacklisted.until) {
+                    await dbRun("DELETE FROM blacklist WHERE user_id = ?", [String(userId)]);
+                } else {
+                    const cacheKey = `chsb_${userId}`;
+                    if (!chsbNotifyCache.has(cacheKey) || Date.now() - chsbNotifyCache.get(cacheKey) > 60000) {
+                        chsbNotifyCache.set(cacheKey, Date.now());
+                        
+                        let timeStr = isBlacklisted.until === 0 ? "НАВСЕГДА" : `до ${new Date(isBlacklisted.until).toLocaleString('ru-RU')}`;
+                        const banText = `😈 Вы были занесены в ЧС бота ${timeStr} по причине: ${isBlacklisted.reason}`;
+                        
+                        const banKb = Keyboard.builder().inline()
+                            .urlButton({ label: 'Получить разбан', url: `https://vk.ru/topic-243089386_69303056` })
+                            .row()
+                            .urlButton({ label: 'Правила бота', url: `https://vk.com/public${GROUP_ID}` });
+                        
+                        try {
+                            await vk.api.messages.send({
+                                peer_id: peerId,
+                                message: banText,
+                                keyboard: banKb.toString(),
+                                random_id: Math.floor(Math.random() * 1000000000),
+                                disable_mentions: 1
+                            });
+                        } catch(e) {}
+                    }
+                    return; 
+                }
+            }
+        }
+
+        // --- МУТ ---
+        if (message.isChat && userId !== ADMIN_ID) {
+            const activeMute = await dbGet("SELECT mute_until FROM mutes WHERE user_id = ? AND peer_id = ?", [String(userId), String(peerId)]);
+            if (activeMute) {
+                if (Date.now() < activeMute.mute_until) {
+                    try {
+                        await vk.api.messages.delete({ 
+                            peer_id: peerId, 
+                            cmids: [message.conversationMessageId], 
+                            delete_for_all: 1 
+                        });
+                    } catch (e) {
+                        try {
+                            await vk.api.messages.delete({ message_ids: [message.id], delete_for_all: 1 }); 
+                        } catch(e2) {}
+                    }
+                    return; 
+                } else {
+                    await dbRun("DELETE FROM mutes WHERE user_id = ? AND peer_id = ?", [String(userId), String(peerId)]);
+                }
+            }
+        }
+
+        // --- АНТИСПАМ ---
+        if (message.isChat && userId !== ADMIN_ID) {
+            const spamEnabled = await dbGet("SELECT value FROM settings WHERE key = 'antispam_enabled'");
+            if (spamEnabled && spamEnabled.value === '1') {
+                const limitDb = await dbGet("SELECT value FROM settings WHERE key = 'antispam_limit'");
+                const timeDb = await dbGet("SELECT value FROM settings WHERE key = 'antispam_time'");
+                const muteDb = await dbGet("SELECT value FROM settings WHERE key = 'antispam_mute'");
+                
+                const limit = Number(limitDb?.value || 5);
+                const timeSec = Number(timeDb?.value || 60);
+                const muteMin = Number(muteDb?.value || 10);
+
+                const now = Date.now();
+                const cacheKey = `${peerId}_${userId}`;
+                let spamData = spamCache.get(cacheKey);
+
+                if (!spamData) {
+                    spamData = { count: 0, lastReset: now, isMuted: false, muteEndTime: 0 };
+                }
+
+                if (spamData.isMuted) {
+                    if (now < spamData.muteEndTime) {
+                        try { 
+                            await vk.api.messages.delete({ message_ids: [message.id], delete_for_all: 1 }); 
+                        } catch (e) {}
+                        return; 
+                    } else {
+                        spamData.isMuted = false;
+                    }
+                }
+
+                if (now - spamData.lastReset >= timeSec * 1000) {
+                    spamData.count = 0;
+                    spamData.lastReset = now;
+                }
+
+                spamData.count++;
+                spamCache.set(cacheKey, spamData);
+
+                if (spamData.count >= limit && !spamData.isMuted) {
+                    spamData.isMuted = true; 
+                    spamData.muteEndTime = now + (muteMin * 60 * 1000);
+                    spamCache.set(cacheKey, spamData);
+                    
+                    try {
+                        await vk.api.messages.changeConversationMemberRestrictions({
+                            group_id: GROUP_ID,
+                            peer_id: peerId,
+                            member_id: userId,
+                            action: 'ro',
+                            for: muteMin * 60
+                        });
+                        
+                        await message.reply(`🚫 [id${userId}|Игрок] получил блокировку чата на ${muteMin} минут за нарушение антиспама.`);
+                        spamData.count = 0; 
+                        spamCache.set(cacheKey, spamData);
+
+                        try { 
+                            await vk.api.messages.delete({ message_ids: [message.id], delete_for_all: 1 }); 
+                        } catch(e) {}
+                    } catch(e) {
+                        spamData.isMuted = false;
+                        spamCache.set(cacheKey, spamData);
+                    }
+                }
+            }
+        }
+
+        // --- НАСТРОЙКИ ---
+        if (userId === ADMIN_ID && adminStates.has(userId)) {
+            const state = adminStates.get(userId);
+            const val = parseFloat(cleanText);
+            if (!isNaN(val) && val > 0) {
+                await dbRun("UPDATE settings SET value = ? WHERE key = ?", [String(val), state]);
+                adminStates.delete(userId);
+                
+                const enabled = (await dbGet("SELECT value FROM settings WHERE key = 'antispam_enabled'")).value;
+                const limit = (await dbGet("SELECT value FROM settings WHERE key = 'antispam_limit'")).value;
+                const time = (await dbGet("SELECT value FROM settings WHERE key = 'antispam_time'")).value;
+                const mute = (await dbGet("SELECT value FROM settings WHERE key = 'antispam_mute'")).value;
+
+                let statusText = enabled === '1' ? "🟢 Включен" : "🔴 Выключен";
+
+                return await message.reply(`✅ Настройки сохранены!\n\n⚙️ Настройки антиспама:\nСтатус: ${statusText}`, {
+                    keyboard: await getSettingsKb(enabled, limit, time, mute)
+                });
+            } else {
+                return await message.reply("❌ Введите корректное число больше 0.");
+            }
+        }
+
+        // [НОВОЕ] ПРОВЕРКА ОТВЕТА НА МАТЕМАТИКУ
+        if (activeMathGames.has(String(peerId)) && !text.startsWith('/')) {
+            const game = activeMathGames.get(String(peerId));
+            const userAnswer = parseInt(text);
+            
+            if (!isNaN(userAnswer) && userAnswer === game.answer) {
+                activeMathGames.delete(String(peerId)); // Удаляем, чтобы не ответили дважды
+                await updateBalance(userId, game.reward);
+                return await message.reply(`🎁 Пользователь @id${userId} ответил правильно на пример и получает ${formatMoney(game.reward)} монет!`);
+            }
+        }
+
+        const validCmds = ['стакан', 'кубик', 'монетка', 'дрим', 'краш', 'рулетка', 'рул', 'автомат', 'блэкджек', 'мины', 'топ', 'профиль', 'баланс', 'бизнес', 'машины', 'работа', 'бонус', 'фортуна', 'казино', 'help', 'помощь', 'start', 'начать', 'transfer', 'перевод', 'duel', 'вывести', 'мойбизнес', 'закрыть', 'rep', 'реп', 'промолист', 'promo', 'купить', 'купитьбиз', 'чсб', 'разчсб', 'kick', 'выдать', 'обнулить', 'создать', 'cp', 'ping', 'пинг', 'убрать', 'настройки', 'дом', 'дома', 'гараж', 'гаражи', 'продать', 'бан', 'kl', 'mute', 'unmute', 'размут', 'unban', 'разбан', 'заморозить', 'разморозить', 'снять', 'unfreeze', 'pr', 'sellcar', 'слить', 'дон', 'дондом', 'донгараж', 'sellhome', 'restart', 'рестарт'];
+        
+        if (!text.startsWith('/') && !validCmds.includes(cmdWord)) {
+            return; 
+        }
+
+        // --- УРОВНИ ---
+        let userRow = await dbGet("SELECT xp, level, reg_date FROM users WHERE user_id = ?", [String(userId)]);
+        if (!userRow) {
+            const today = new Date().toLocaleDateString('ru-RU');
+            await dbRun("INSERT INTO users (user_id, balance, reg_date) VALUES (?, 1000, ?)", [String(userId), today]);
+        } else {
+            if (!userRow.reg_date) {
+                const today = new Date().toLocaleDateString('ru-RU');
+                await dbRun("UPDATE users SET reg_date = ? WHERE user_id = ?", [today, String(userId)]);
+            }
+            let newXp = (Number(userRow.xp) || 0) + 40;
+            let newLvl = Number(userRow.level) || 1;
+            while (newXp >= newLvl * 500) {
+                newXp -= newLvl * 500;
+                newLvl++;
+            }
+            await dbRun("UPDATE users SET xp = ?, level = ? WHERE user_id = ?", [newXp, newLvl, String(userId)]);
+        }
+
+        if (message.isChat) {
+            const existing = await dbGet("SELECT count FROM chat_messages WHERE peer_id = ? AND user_id = ?", [String(peerId), String(userId)]);
+            if (existing) {
+                await dbRun("UPDATE chat_messages SET count = count + 1 WHERE peer_id = ? AND user_id = ?", [String(peerId), String(userId)]);
+            } else {
+                await dbRun("INSERT INTO chat_messages (peer_id, user_id, count) VALUES (?, ?, 1)", [String(peerId), String(userId)]);
+            }
+        }
+
+        const balance = await getBalance(userId);
+        const rep = await getReputation(userId);
+
+        const replyParams = (kb = undefined) => {
+            const p = { disable_mentions: 1 };
+            if (kb) p.keyboard = kb;
+            return p;
+        };
+
+        // ===== КОМАНДЫ =====
+        if (cmdWord === 'начать' || cmdWord === 'start') {
+            if (message.isChat) {
+                try {
+                    const members = await vk.api.messages.getConversationMembers({ peer_id: peerId });
+                    const admin = members.items.find(m => m.member_id === userId && (m.is_admin || m.is_owner));
+                    
+                    if (!admin && userId !== ADMIN_ID) {
+                        return await message.reply("⚠️ Ошибка! Вы не являетесь администратором беседы. Чтобы активировать бота, попросите администратора написать /start.", replyParams());
+                    }
+                    return await message.reply("✅ Бот успешно активирован в этой беседе! Напишите /help для списка команд.", replyParams());
+                } catch(e) {
+                    return await message.reply("⚠️ Ошибка! Убедитесь, что я являюсь администратором беседы.", replyParams());
+                }
+            } else {
+                return await message.reply("👋 Привет! Я Официальный бот Game Zone. Выбирай действие на клавиатуре или напиши /help.", replyParams(mainKb));
+            }
+        }
+
+        if (cmdWord === 'help' || cmdWord === 'помощь' || cmdWord === 'команды') {
+            return await message.reply("📖 Выберите раздел с командами:", replyParams(getHelpKb()));
+        }
+
+        if (cmdWord === 'ping' || cmdWord === 'пинг') {
+            const start = Date.now();
+            try { await vk.api.users.get({ user_ids: userId }); } catch (e) {}
+            const ping = Date.now() - start;
+            
+            let status = "🟢 Отлично";
+            if (ping > 150) status = "🟡 Нормально";
+            if (ping > 300) status = "🔴 Плохо";
+
+            return await message.reply(`🏓 Понг!\n\n⚡ Скорость соединения: ${ping} мс\n📊 Статус сети: ${status}`, replyParams());
+        }
+
+        // --- ПРОФИЛЬ ---
+        if (cmdWord === 'профиль' || cmdWord === 'баланс') {
+            // [ОБНОВЛЕНО] Добавлен вывод телефона
+            const uInfo = await dbGet("SELECT xp, level, reg_date, car, phone FROM users WHERE user_id = ?", [String(userId)]);
+            const lvl = uInfo.level || 1;
+            const xp = uInfo.xp || 0;
+            const needXp = lvl * 500;
+            const date = uInfo.reg_date || new Date().toLocaleDateString('ru-RU');
+            const car = uInfo.car || "Нет";
+            const phone = uInfo.phone || "Нет";
+            
+            const houseData = await dbGet("SELECT location, tier FROM properties WHERE owner_id = ? AND type = 'house'", [String(userId)]);
+            const garageData = await dbGet("SELECT location, tier FROM properties WHERE owner_id = ? AND type = 'garage'", [String(userId)]);
+            
+            const houseStr = houseData ? `${houseData.location} (Т${houseData.tier})` : "Нет";
+            const garageStr = garageData ? `${garageData.location} (Т${garageData.tier})` : "Нет";
+
+            const profText = `🏠 Профиль ${await getFullName(userId)}\n\n💵 Баланс: ${formatMoney(balance)}$\n⭐ Репутация: ${rep}\n📊 Уровень: ${lvl} (${xp}/${needXp} XP)\n📱 Телефон: ${phone}\n\n🏠 Дом: ${houseStr}\n🏘️ Гараж: ${garageStr}\n🚗 Машина: ${car}\n\n📅 Регистрация: ${date}\n🆔 ID: ${userId}`;
+
+            let attachment = null;
+            try {
+                const photoBuffer = await generateProfileImage(userId);
+                if (photoBuffer) {
+                    const uploaded = await vk.upload.messagePhoto({ source: { value: photoBuffer } });
+                    attachment = uploaded.toString();
+                }
+            } catch(e) {
+                console.error("Ошибка загрузки фото профиля:", e);
+            }
+
+            return await message.reply({
+                message: profText,
+                attachment: attachment || undefined,
+                disable_mentions: 1
+            });
+        }
+
+        // [НОВОЕ] КОМАНДА /купить сим карту
+        if (cmdWord === 'купить' && parts[1] === 'сим' && parts[2] === 'карту') {
+            const phoneNumber = parts[3];
+            if (!phoneNumber || !/^\d{4}$/.test(phoneNumber)) {
+                return await message.reply('❌ Введите ровно 4 цифры. Пример: /купить сим карту 7766', replyParams());
+            }
+
+            const user = await dbGet("SELECT phone FROM users WHERE user_id = ?", [String(userId)]);
+            if (user && user.phone && user.phone !== 'Нет') {
+                return await message.reply('❌ Вы уже купили сим-карту. Можно купить только один слот.', replyParams());
+            }
+
+            const existing = await dbGet("SELECT user_id FROM phones WHERE number = ?", [phoneNumber]);
+            if (existing) {
+                return await message.reply('❌ Этот номер уже занят другим пользователем.', replyParams());
+            }
+
+            await dbRun("INSERT INTO phones (number, user_id) VALUES (?, ?)", [phoneNumber, String(userId)]);
+            await dbRun("UPDATE users SET phone = ? WHERE user_id = ?", [phoneNumber, String(userId)]);
+
+            return await message.reply(`✅ Вы успешно купили сим-карту с номером ${phoneNumber}! Теперь он отображается в вашем профиле.`, replyParams());
+        }
+
+        // [НОВОЕ] КОМАНДА /sellhome (продажа дома)
+        if (cmdWord === 'sellhome' || (cmdWord === 'продать' && parts[1] === 'дом')) {
+            const prop = await dbGet("SELECT id, type, location FROM properties WHERE owner_id = ? AND type = 'house' LIMIT 1", [String(userId)]);
+            if (!prop) {
+                return await message.reply('❌ У вас нет дома, который можно продать государству.', replyParams());
+            }
+
+            const locData = PROPERTY_DATA[prop.location.toLowerCase()];
+            if (!locData) return await message.reply('❌ Ошибка: данные о доме не найдены.', replyParams());
+
+            const sellPrice = Math.floor(locData.housePrice * 0.70);
+            await updateBalance(userId, sellPrice);
+            await dbRun("DELETE FROM properties WHERE id = ?", [prop.id]);
+
+            return await message.reply(`🏠 Вы успешно продали свой дом государству!\n💰 Вы получили 70% от стоимости: ${formatMoney(sellPrice)} монет.`, replyParams());
+        }
+
+        // [НОВОЕ] КОМАНДА /restart (только для владельца)
+        if (cmdWord === 'restart' || cmdWord === 'рестарт') {
+            if (userId !== ADMIN_ID) {
+                return await message.reply('⛔ У вас нет прав на использование этой команды.', replyParams());
+            }
+            await message.reply('🔄 Бот перезапускается...');
+            setTimeout(() => process.exit(1), 1500);
+            return;
+        }
+
+        // --- АВТОСАЛОН ---
+        if (cmdWord === 'машины') {
+            let txt = "🚗 Доступные машины в автосалоне:\n\n";
+            for (const [key, data] of Object.entries(CARS_DATA)) {
+                txt += `${data.name} — ${formatMoney(data.price)}$\n`;
+            }
+            txt += "\n🛒 Чтобы купить, напишите: /купить машина [Название]\nПример: /купить машина м5 ф90";
+            return await message.reply(txt, replyParams());
+        }
+
+        if (cmdWord === 'купить' && parts[1] === 'машина') {
+            const args = message.text.split(' ');
+            args.shift(); 
+            args.shift(); 
+            const query = args.join(' ').toLowerCase
